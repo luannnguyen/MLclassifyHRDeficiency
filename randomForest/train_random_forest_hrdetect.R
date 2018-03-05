@@ -1,539 +1,560 @@
 #========= Load packages =========#
-packages <- c(#'glmnet',
-              'ggplot2',
-              'ggfortify',
-              'dplyr',
-              'reshape2',
-              'randomForest',
-              'ROCR')
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(randomForest)
+library(ROCR)
+library(stringr)
+library(gridExtra)
 
-ipak <- function(pkg){
-   new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
-   if (length(new.pkg)) 
-      install.packages(new.pkg, dependencies = TRUE)
-   sapply(pkg, require, character.only = TRUE)
-}
-
-ipak(packages)
-
+#========= Global options =========#
 options(stringsAsFactors = F)
 
+###############################
+#          Functions          #
+###############################
+
 #========= Misc. functions =========#
-#--------- Normalize data according to HRDetect paper ---------#
-normalize_data <- function(df, na.replace = T){
-   df_norm <- apply(df,2,function(v){
-      #v <- as.numeric(v)
-      ln_v <- log(v+1, exp(1))
-      norm_v <- (ln_v - mean(ln_v, na.rm = T) ) / sd(ln_v, na.rm = T)
-      
-      if(na.replace == T){
-         norm_v[is.na(norm_v)] <- median(norm_v, na.rm = T) ## replace NA with median
-      }
-      
-      return(norm_v)
-   })
-   return( as.data.frame(df_norm) )
+#--------- Convert multiclass response to binary response ---------#
+get_simpleResponse <- function(chrVector, Tclasses, Treturn, Fclasses, Freturn, asFactor = TRUE)
+{
+   
+   chrVector <- as.character(chrVector)
+   
+   chrVector[chrVector %in% Tclasses] <- Treturn
+   chrVector[chrVector %in% Fclasses] <- Freturn
+   
+   if(asFactor == TRUE){
+      return(as.factor(chrVector))
+   } else {
+      return(chrVector)
+   }
 }
 
-#--------- Calculate false positive and negative rate ---------#
-get_fPosNegRate <- function(v_logical_expected,v_logical_predicted)
+#--------- Integration by trapezoidal rule from data frame giving discrete x and y points ---------#
+integrateDiscrete <- function(df, x='x', y='y')
 {
-   # v_logical_expected <- rf_vs_annotation$Gene_simple
-   # v_logical_predicted <- rf_vs_annotation$RFpBRCA_umcuData_sangerTrained > 0.62
-   df <- cbind(v_logical_expected,v_logical_predicted) %>% as.data.frame()
-   
-   fpos <- nrow(df[df$v_logical_expected == 1 & df$v_logical_predicted == 0,])
-   fneg <- nrow(df[df$v_logical_expected == 0 & df$v_logical_predicted == 1,])
-   
-   tpos <- nrow(df[df$v_logical_expected == 1 & df$v_logical_predicted == 1,])
-   tneg <- nrow(df[df$v_logical_expected == 0 & df$v_logical_predicted == 0,])
-   
-   fpos_rate <- fpos/(fpos+tneg)
-   fneg_rate <- fneg/(fneg+tpos)
-   
-   tpos_rate <- tpos/(tpos+fpos)
-   tneg_rate <- tneg/(tneg+fneg)
-   
-   fPosNegRate <- c(fpos_rate,fneg_rate,tpos_rate,tneg_rate)
-   names(fPosNegRate) <- c('fpos_rate','fneg_rate','tpos_rate','tneg_rate')
-   
-   return(fPosNegRate)
+   sapply(1:(nrow(df)-1),function(i){
+      trapez <- df[i:(i+1),]
+      area <- (trapez[2,x] - trapez[1,x])*((trapez[2,y] + trapez[1,y])/2)
+      return(area)
+   }) %>% sum()
 }
 
 #========= Random forest functions =========#
-#--------- Select mtry where out of bag (OOB) error is minimal ---------#
-## Each decision tree node is split using a number of features (mtry)
-tuneRF_iterate <- function(df, colname_response, tuneRF_iterations = 20)
+#--------- Balance classes ---------#
+balanceClasses <- function(df, colname_response, scaling = 'up')
 {
-   ## run random forest with multiple mtry's
-   # df <- normdata_ss
-   # colname_response <- 'brca_deficiency'
-   v_test_mtry <- sapply(1:tuneRF_iterations, function(i)
-   {
-      mtry <- tuneRF(x = df[,-which(colnames(df) == colname_response)], #df of features/observations
-                     y = df[,colname_response], ## vector of expected response
-                     ntreeTry=500, #number of trees to create
-                     stepFactor=1.3, #inflation rate of mtry for each iteration
-                     improve=0.01, #relative improvement in OOB error must be by this much for the search to continue
-                     trace=F,
-                     plot=F
+   # df <- df_umcuNormData
+   
+   classFreq <- df[,colname_response] %>% table() %>% as.data.frame()
+   
+   if(scaling == 'up'){ 
+      targetFreq <- classFreq$Freq %>% max() 
+   } else if(scaling == 'down') {
+      targetFreq <- classFreq$Freq %>% min() 
+   }
+   
+   targetFreqClass <- classFreq[classFreq$Freq == targetFreq,'.']
+   
+   df_BalancedClasses <- lapply( as.character(classFreq$.), function(i){
+      df_ss <- df[df[,colname_response] == i,] 
+      
+      if(scaling == 'up'){
+         if(i != targetFreqClass){ 
+            sample(1:nrow(df_ss), targetFreq, replace = T) %>% df_ss[.,]
+         } else {
+            df_ss
+         }
+      
+      } else if(scaling == 'down'){
+         sample(1:nrow(df_ss), targetFreq, replace = F) %>% df_ss[.,]
+      }
+      
+   }) %>% do.call(rbind,.) %>% .[order(rownames(.)),]
+
+   return(df_BalancedClasses)
+}
+
+#--------- Random forest training and validation ---------# 
+## Train RF on a train set
+## Predict on a test set
+## Outputs list(RF object, predictions)
+
+## Depends on: balanceClasses()
+
+randomForest_trainAndTest <- function(df_train, df_test, colname_response, balance=F, bootstrap=F,inclExpectedResponse=T,
+                                      ntreeTry=500, stepFactor=1.2, improve=0.001, plot=F, trace=F, ## tuneRF() default args
+                                      randomForest_ntree = 500, importance = T, ## randomForest() default args
+                                      ...)
+{
+   # df_train <- l_df_train[[1]]
+   # df_test <- l_df_test[[1]]
+   
+   #--------- Up/down balance classes ---------#
+   if(balance == T | balance == 'up'){
+      df_train <- balanceClasses(df_train, colname_response, scaling = 'up')
+   } else if (balance == 'down'){
+      df_train <- balanceClasses(df_train, colname_response, scaling = 'down')
+   }
+   
+   #--------- bootstrap aggregation; prevents overfitting of model ---------#
+   if(bootstrap == T){
+      inBag_samples <- sample(1:nrow(df_train), (nrow(df_train) * 0.63212056) %>% round(0) ) ## 0.632 rule; choose ~2/3 of data set for bagging
+      
+      df_train <- df_train[inBag_samples,]
+      df_train <- df_train[rownames(df_train) %>% order,]
+   }
+   
+   #--------- Get mtry where OOBE is min ---------#
+   mtryTune <- tuneRF(x = df_train %>% .[,colnames(.) != colname_response], #df of features/observations
+                      y = df_train %>% .[,colname_response], ## vector of expected response
+                      ntreeTry=ntreeTry, ## number of trees to create
+                      stepFactor=stepFactor, ## inflation rate of mtry for each iteration
+                      improve=improve, ## relative improvement in OOB error must be by this much for the search to continue
+                      plot=plot, 
+                      trace=trace,
+                      ...)
+   
+   mtryBest <- 
+      mtryTune %>% 
+      .[.[,2] == min(.[,2]),1] %>% 
+      .[length(.)] ## always select the highest mtry
+   
+   #--------- Fit RF model ---------#
+   RF <- randomForest(x = df_train %>% .[,colnames(.) != colname_response],
+                      y = df_train %>% .[,colname_response],
+                      ntree = randomForest_ntree,
+                      importance = importance,
+                      mtry = mtryBest,
+                      ...)
+   
+   #--------- Predict ---------#
+   pred <- predict(object = RF, newdata = df_test[,colnames(df_test) != 'response'], type = "prob")
+   pred <- pred %>% as.data.frame()
+   
+   if(inclExpectedResponse == T){
+      
+      pred$response <- df_test[,colname_response]
+   }
+   
+   #--------- Return RF and prediction object ---------#
+   RF_CV <- list()
+   RF_CV$RF <-  RF
+   RF_CV$pred <- pred
+   return(RF_CV)
+}
+
+#--------- Get train/test sets ---------#
+get_cvTrainTestSets <- function(df, k=10)
+{
+   
+   ## Shuffle data
+   df_shuffled <- df[sample(1:nrow(df)),]
+   nSamples <- round(nrow(df_shuffled)/k)
+   
+   ## Main
+   l_Train_Test <- lapply(1:k, function(i){
+      ## Get test set row indices for fold k
+      if(k != i){
+         testSet <- c( (nSamples*(i-1)+1) : (nSamples*i) )
+      } else if (k == i){
+         testSet <- c( (nSamples*(i-1)+1) : nrow(df_shuffled) ) ## Prevents error if last sample group does not have exactly nSamples.
+      }
+      
+      ## Return list of train and test sets
+      list(train = df_shuffled[-testSet,],
+           test = df_shuffled[testSet,]
       )
-      
-      mtrys_minOOBerror <- mtry[mtry[,2] == min(mtry[,2]),1]
-      mtrys_minOOBerror[length(mtrys_minOOBerror)] ## always pick the higher mtry value if two rows have the same minOOBerror
-      #mtry[(mtry[,2] == min(mtry[,2])) %>% which() %>% min(),][1]
    })
    
-   ## get rounded average
-   mtry_best <- mean(v_test_mtry) %>% round(0)
-   return(mtry_best)
+   return(l_Train_Test)
 }
 
-#--------- Get bagged training set ---------#
-# df <- normdata_ss
-# colname_response <- 'brca_deficiency'
-
-get_baggedTrainingSet <- function(df){
-   train_set <- sample(1:nrow(df), (nrow(df) * 0.63212056) %>% round(0) ) ## 0.632 rule; choose ~2/3 of data set for bagging
-   df_ss <- df[train_set,]
-   df_ss <- df_ss[rownames(df_ss) %>% order,]
-   
-   return(df_ss)
-}
-
-#--------- Up sample low occurrence observations ---------#
-df_ss <- get_baggedTrainingSet(df)
-
-balanceClasses <- function(df)
-
-#--------- Create and combine multiple random forests ---------#
-#set.seed(Sys.time())
-randomForest_iterate <- function(df, colname_response, mtry_best, randomForest_iterations = 100)
+#--------- Random forest k-fold cross validation ---------#
+## Depends on: get_cvTrainTestSets()
+randomForest_CV <- function(df,colname_response,k=10,...)
 {
-   # df <- normdata_ss
-   # colname_response <- 'brca_deficiency'
-   # mtry_best <- mtry_best_sanger
+   l_TrainTestSets <- get_cvTrainTestSets(df,k=k)
    
-   ## run multiple random forests
-   l_RF <- lapply(1:randomForest_iterations,function(i)
-   {
-      # train_set <- sample(1:nrow(df), (nrow(df) * 0.63212056) %>% round(0) ) ## 0.632 rule; choose ~2/3 of data set for bagging
-      # df_ss <- df[train_set,]
+   l_RF_CV <- lapply(1:k, function(i){
+      message(paste0('< CV: round ', i,' >'))
+      df_train <- l_TrainTestSets[[i]]$train
+      df_test <- l_TrainTestSets[[i]]$test
       
-      df_ss <- get_baggedTrainingSet(df)
-      
-      randomForest(formula = as.formula(paste0('df_ss$',colname_response,' ~ .')),
-                   data = df_ss,
-                   ntree = 500,
-                   mtry = mtry_best,
-                   importance = T)
+      randomForest_trainAndTest(df_train, df_test, colname_response,...)
    })
    
-   ## combine random forests into a consensus forest
-   RF_combined <-
-      paste0('l_RF[[',1:randomForest_iterations,']]', collapse = ',') %>% ## paste 'l_RF[[1]],l_RF[[2]],...'
-      paste0('combine(',.,')') %>% ## paste 'combine(l_RF[[1]],l_RF[[2]],...)'
-      parse(text = .) %>% eval() ## evaluate string as expression
-   
-   return(RF_combined)
+   return(l_RF_CV)
 }
 
-#========= Data prep =========#
-#--------- Prepare umcu data ---------#
-umcu_signature_matrices_path <- '/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/matrices/umcu_matrices/'
-
-umcu_snv_tsv <- paste0(umcu_signature_matrices_path,'final_table_SNV.txt')
-umcu_indel_tsv <- paste0(umcu_signature_matrices_path,'final_table_indels.txt')
-umcu_sv_tsv <- paste0(umcu_signature_matrices_path,'final_table_SV.txt')
-
-read.tsv <- function(file){ 
-   read.table(file,sep='\t',header=T)
+#--------- Extract information from randomForest_CV ---------#
+aggregate_rfCV <- function(rfCV_object, var)
+{
+   ## MeanDecreaseAccuracy
+   if(var == 'importance'){
+      output <- lapply(rfCV_object, function(i){ i$RF %>% importance(.,type=1) }) %>% do.call(cbind,.) %>% apply(.,1,mean)
+      output <- data.frame(feature = names(output), MeanDecreaseAccuracy=output)
+      rownames(output) <- NULL
+   }
+   
+   ## Prediction probabilities
+   else if (var == 'prediction'){
+      output <- lapply(rfCV_object, function(i){ i$pred }) %>% do.call(rbind,.) %>% .[order(rownames(.)),]
+   }
+   
+   return(output)
 }
 
-df_umcu_snv <- read.tsv(umcu_snv_tsv)
-df_umcu_indel <- t(read.tsv(umcu_indel_tsv)) %>% as.data.frame()
-df_umcu_sv <- read.tsv(umcu_sv_tsv)
-
-## rm 'a' from donor id
-rownames(df_umcu_snv) <- rownames(df_umcu_snv) %>% gsub('a','',.)
-rownames(df_umcu_indel) <- rownames(df_umcu_indel) %>% gsub('a','',.)
-
-## intersect donors
-l_rownames <- list(rownames(df_umcu_snv),rownames(df_umcu_indel),rownames(df_umcu_sv))
-common_donors <- Reduce(intersect, l_rownames)
-
-## only keep common donors
-df_umcu_snv_ss <- df_umcu_snv[rownames(df_umcu_snv) %in% common_donors,]
-df_umcu_indel_ss <- df_umcu_indel[rownames(df_umcu_indel) %in% common_donors,]
-df_umcu_sv_ss <- df_umcu_sv[rownames(df_umcu_sv) %in% common_donors,]
-
-## replace snv signature colnames with sanger format
-colnames(df_umcu_snv_ss) <- colnames(df_umcu_snv_ss) %>% gsub('Signature','e',.)
-
-## replace sv signature colnames with sanger format
-colnames(df_umcu_sv_ss) <- colnames(df_umcu_sv_ss) %>% gsub('SV_Signature_','SV',.)
-
-## combine repeat insertion/deletion 1,2,3 contexts; calculate relative contribution for all contexts
-# df_umcu_indel_ss %>% head()
-# colnames(rawdata)
-
-df_umcu_indel_ss_rowsums <- df_umcu_indel_ss %>% apply(.,1,sum)
-
-del.rep.prop <- (df_umcu_indel_ss[,c(1,3,5)] %>% apply(.,1,sum)) / df_umcu_indel_ss_rowsums
-del.mh.prop <- df_umcu_indel_ss$micro_hom_deletion / df_umcu_indel_ss_rowsums
-
-ins.rep.prop <- (df_umcu_indel_ss[,c(2,4,6)] %>% apply(.,1,sum)) / df_umcu_indel_ss_rowsums
-ins.mh.prop <- df_umcu_indel_ss$micro_hom_insertion / df_umcu_indel_ss_rowsums
-
-ins <- ( ( df_umcu_indel_ss[,c(2,4,6)] %>% apply(.,1,sum) ) + df_umcu_indel_ss$micro_hom_insertion ) / df_umcu_indel_ss_rowsums
-
-indel.none.prop <- df_umcu_indel_ss$no_context / df_umcu_indel_ss_rowsums
-
-df_umcu_indel_ss2 <- cbind(df_umcu_indel_ss[,1], del.rep.prop, del.mh.prop,ins.rep.prop,ins.mh.prop,indel.none.prop)
-df_umcu_indel_ss2 <- df_umcu_indel_ss2[,-1]
-
-df_umcu_indel_ss2_sangerFormat <- cbind(df_umcu_indel_ss[,1], del.rep.prop, del.mh.prop, ins, indel.none.prop)
-df_umcu_indel_ss2_sangerFormat <- df_umcu_indel_ss2_sangerFormat[,-1]
-
-## final normalized signature martrix
-umcu_normdata <- cbind(df_umcu_snv_ss,df_umcu_indel_ss2,df_umcu_sv_ss) %>% normalize_data()
-umcu_normdata_indelSangerFormat <- cbind(df_umcu_snv_ss,df_umcu_indel_ss2_sangerFormat,df_umcu_sv_ss) %>% normalize_data()
-
-#--------- Sanger data ---------#
-normdata_ss <- read.table('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/matrices/signature_matrices/sanger_pipeline_signature_matrix_norm.tsv',
-                       sep = '\t', header = T)
-
-rownames(normdata_ss) <- rownames(normdata_ss) %>% 
-   gsub('a2','',.) %>% 
-   gsub('a','',.) %>%
-   gsub('b','',.)
-
-rawdata <- read.table('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/supplementary_data/nm.4292-S2_raw_data.txt',
-                      sep = '\t', header = T)
-
-rawdata$Sample <- rawdata$Sample %>% 
-   gsub('a2','',.) %>% 
-   gsub('a','',.) %>%
-   gsub('b','',.)
-
-#--------- Assign brca deficiency columns ---------#
-v_brca_deficiency <- as.integer(nchar(as.vector(rawdata$Gene)) > 1) %>% as.factor()
-names(v_brca_deficiency) <- rawdata$Sample
-
-normdata_ss$brca_deficiency <- v_brca_deficiency
-
-common_donors <- intersect(rownames(normdata_ss),rownames(umcu_normdata))
-
-umcu_normdata$brca_deficiency <- v_brca_deficiency[names(v_brca_deficiency) %in% common_donors]
-umcu_normdata_indelSangerFormat$brca_deficiency <- v_brca_deficiency[names(v_brca_deficiency) %in% common_donors]
-
-#========= Training random forest on sanger data =========#
-## Test run random forest
-# ## Determine in-bag samples and run random forest
-# rf_train <- sample(1:nrow(normdata_ss), (nrow(normdata_ss) * 0.63212056) %>% round(0) ) ## 0.632 rule; choose ~2/3 of data set for training
-# rf_normdata_ss <- randomForest(formula = brca_deficiency ~ ., data = normdata_ss, subset = rf_train, ntree = 500)
-
-## Get best mtry
-mtry_best_sanger <- tuneRF_iterate(normdata_ss, 'brca_deficiency')
-
-## training and prediction with all available features in sanger data set
-# rf2_normdata_ss <- randomForest_iterate(normdata_ss, 'brca_deficiency',randomForest_iterations=10)
-# rf_pBRCA <- predict(object = rf2_normdata_ss, newdata = normdata_ss[-23], type = "prob")
-
-## training and prediction without features unavailable in umcu pipeline
-rf2_normdata_ss <- randomForest_iterate(normdata_ss[,-c(5,22)],'brca_deficiency',mtry_best_sanger,randomForest_iterations=100)
-
-RFpBRCA_sangerData_sangerDataTrained <- predict(object = rf2_normdata_ss, newdata = normdata_ss[,-23], type = "prob")
-RFpBRCA_umcuData_sangerDataTrained <- predict(object = rf2_normdata_ss, newdata = umcu_normdata_indelSangerFormat[,colnames(normdata_ss[,-c(5,22,23)])], type = "prob")
-
-#========= Train with umcu data =========#
-## Get best mtry's
-mtry_best_umcu <- tuneRF_iterate(umcu_normdata, 'brca_deficiency')
-
-## Train RF
-rf_umcu_normdata <- randomForest_iterate(umcu_normdata,'brca_deficiency',mtry_best_umcu,randomForest_iterations=100)
-
-## Predict
-RFpBRCA_umcuData_umcuDataTrained <- predict(object = rf_umcu_normdata,newdata = umcu_normdata[,-42],type = "prob")
-
-#========= Train with 50:50 sanger:umcu data =========#
-## Data prep
-#umcu_normdata
-normdata_ss2 <- normdata_ss[rownames(normdata_ss) %in% common_donors,]
-
-s1 <- sample(1:length(common_donors),round(length(common_donors)/2))
-s2 <- which(!(1:length(common_donors) %in% s1))
-
-common_cols <- intersect(colnames(normdata_ss2),colnames(umcu_normdata))
-
-mix_normdata <- rbind(umcu_normdata[s1,common_cols], normdata_ss2[s2,common_cols])
-mix_normdata <- mix_normdata[order(rownames(mix_normdata)),]
-
-## Get best mtry's
-mtry_best_mix <- tuneRF_iterate(mix_normdata, 'brca_deficiency')
-
-## Train RF
-rf_mix_normdata <- randomForest_iterate(mix_normdata,'brca_deficiency',mtry_best_mix,randomForest_iterations=100)
-
-## Predict
-RFpBRCA_mixData_mixDataTrained <- predict(object = rf_mix_normdata,newdata = mix_normdata,type = "prob")
-
-RFpBRCA_sangerData_mixDataTrained <- predict(object = rf_mix_normdata,newdata = normdata_ss[,common_cols[-20]],type = "prob")
-RFpBRCA_umcuData_mixDataTrained <- predict(object = rf_mix_normdata,newdata = umcu_normdata[,common_cols[-20]],type = "prob")
-
-#========= Train with umcu data; use expanded indel contexts =========#
-## data prep
-# Load expanded indel matrices
-expandedMatricesFiles <- list.files('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_ICGC/Breast_560/Indels/',pattern = '*.txt',full.names = T)
-df_umcu_indelExpanded <- lapply(expandedMatricesFiles,function(i){ 
-   df <- read.table(i,header = T,sep='\t')
-   rownames(df) <- df[,1]
-   df[,1] <- NULL
-   return(df)
-})
-df_umcu_indelExpanded <- do.call(cbind,df_umcu_indelExpanded) %>% t() %>% as.data.frame()
-rownames(df_umcu_indelExpanded) <- rownames(df_umcu_indelExpanded) %>% 
-   gsub('a2','',.) %>% 
-   gsub('a','',.) %>%
-   gsub('b','',.)
-
-df_umcu_indelExpanded_ss <- df_umcu_indelExpanded[rownames(df_umcu_indelExpanded) %in% common_donors,]
-colnames(df_umcu_indelExpanded_ss) <- paste0(c('del.rep.','ins.rep.','del.mh.','ins.mh.','indel.none.') %>% rep(.,each=5),1:5,'.prop')
-
-umcu_normdata_expandedIndel <- cbind(df_umcu_snv_ss,df_umcu_indelExpanded_ss/apply(df_umcu_indelExpanded_ss,1,sum),df_umcu_sv_ss) %>% normalize_data()
-umcu_normdata_expandedIndel$brca_deficiency <- v_brca_deficiency[names(v_brca_deficiency) %in% common_donors]
-
-## Get best mtry's
-mtry_best_umcu_normdata_expandedIndel <- tuneRF_iterate(umcu_normdata_expandedIndel, 'brca_deficiency')
-
-## Train RF
-rf_umcu_normdata_expandedIndel <- randomForest_iterate(umcu_normdata_expandedIndel,
-                                                       'brca_deficiency',
-                                                       mtry_best_umcu_normdata_expandedIndel,
-                                                       randomForest_iterations=100)
-
-## Predict
-RFpBRCA_umcuDataExpandedIndel_umcuDataExpandedIndelTrained <- predict(object = rf_umcu_normdata_expandedIndel,
-                                                                      newdata = umcu_normdata_expandedIndel[,-62],
-                                                                      type = "prob")
-
-## Combine del.mh.prop into one feature
-# umcu_normdata_expandedIndel_topFeat <- importance(rf_umcu_normdata_expandedIndel) %>% .[. > median(.),] %>% names()
-# umcu_normdata_expandedIndelFeatSel <- umcu_normdata_expandedIndel[,colnames(umcu_normdata_expandedIndel) %in% umcu_normdata_expandedIndel_topFeat]
-# umcu_normdata_expandedIndelFeatSel$brca_deficiency <- umcu_normdata_expandedIndel$brca_deficiency
-
-mtry_best_umcu_normdata_expandedIndelFeatSel <- tuneRF_iterate(umcu_normdata_expandedIndel, 'brca_deficiency')
-
-umcu_normdata_expandedIndelFeatSel <- cbind(umcu_normdata_expandedIndel[,-(41:45)],df_umcu_indel_ss2 %>% as.data.frame() %>% .$del.mh.prop)
-colnames(umcu_normdata_expandedIndelFeatSel)[58] <- 'del.mh.prop'
-
-rf_umcu_normdata_expandedIndelFeatSel <- randomForest_iterate(umcu_normdata_expandedIndelFeatSel,
-                                                       'brca_deficiency',
-                                                       mtry_best_umcu_normdata_expandedIndelFeatSel,
-                                                       randomForest_iterations=100)
-
-#========= Create rf_vs_annotation for comparison between sanger and umcu data/training =========#
-rf_vs_annotation <- rawdata[rawdata$Sample %in% common_donors,c("Sample","Gene")]
-rf_vs_annotation$Gene_simple <- as.integer(nchar(as.vector(rf_vs_annotation$Gene)) > 0)
-
-rf_vs_annotation$RF1_sangerData_sangerDataTrained <- RFpBRCA_sangerData_sangerDataTrained[rownames(RFpBRCA_sangerData_sangerDataTrained) %in% common_donors,2]
-
-rf_vs_annotation$RF2_umcuData_sangerDataTrained <- RFpBRCA_umcuData_sangerDataTrained[rownames(RFpBRCA_umcuData_sangerDataTrained) %in% common_donors,2]
-rf_vs_annotation$RF3_umcuData_umcuDataTrained <- RFpBRCA_umcuData_umcuDataTrained[,2]
-
-rf_vs_annotation$RF4_mixData_mixDataTrained <- RFpBRCA_mixData_mixDataTrained[,2]
-rf_vs_annotation$RF5_sangerData_mixDataTrained <- RFpBRCA_sangerData_mixDataTrained[rownames(RFpBRCA_sangerData_mixDataTrained) %in% common_donors,2]
-rf_vs_annotation$RF6_umcuData_mixDataTrained <- RFpBRCA_umcuData_mixDataTrained[,2]
-
-rf_vs_annotation$RF7_umcuDataExpandedIndel_umcuDataExpandedIndelTrained <- RFpBRCA_umcuDataExpandedIndel_umcuDataExpandedIndelTrained[,2]
-
-#========= Performance metrics =========#
-#--------- Variable importance; MeanDecreaseAccuracy ---------#
-pdf('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/MeanDecreaseGini_rfTraining_sangerData_umcuData.pdf', 10, 6)
-varImpPlot(rf2_normdata_ss,type=1, main = 'rfTraining_sangerData')
-varImpPlot(rf_umcu_normdata,type=1, main = 'rfTraining_umcuData')
-varImpPlot(rf_mix_normdata,type=1, main = 'rfTraining_mixData')
-# varImpPlot(rf_umcu_normdata_expandedIndel,type=2, main = 'rfTraining_umcuData_expandedIndel')
-# varImpPlot(rf_umcu_normdata_expandedIndelFeatSel,type=2, main = 'rfTraining_umcuData_expandedIndelFeatSel')
-dev.off()
-
-# #--------- ROC curve and AUC ---------#
-# sapply(4:ncol(rf_vs_annotation),function(i){
-#    pred <- prediction(rf_vs_annotation[,i], rf_vs_annotation$Gene_simple)
-#    perf <- performance(pred,'auc')
-#    perf@y.values[[1]]
-# })
-
-# pred <- prediction(rf_vs_annotation$RF3_umcuData_umcuDataTrained, rf_vs_annotation$Gene_simple)
-# perf <- performance(pred,"tpr","fpr")
-# performance(pred, "auc")
-# plot(perf,colorize=TRUE)
-
-#--------- Plot true positive and true negative rate across p values ---------#
-p_range <- seq(from=0, to=1.0, by=0.01)
-
-## for random forest
-l_fpnRates <- lapply(4:ncol(rf_vs_annotation),function(i){
-   fpnRates <- lapply(p_range, function(j){
-      get_fPosNegRate(rf_vs_annotation$Gene_simple,rf_vs_annotation[,i] > j)
-   }) %>% do.call(rbind,.) %>% as.data.frame()
+#--------- Plot MeanDecreaseAccuracy from aggregate_rfCV() output ---------#
+plot_MeanDecreaseAccuracy <- function(df_importance, title='Feature importance', sort=T, topn=10)
+{
+   #df_importance <- agg_imp
    
-   fpnRates$p <- p_range
-   fpnRates$analysis <- colnames(rf_vs_annotation)[i]
+   ## Sort features by MeanDecreaseAccuracy
+   if(sort == T){
+      df_importance <- df_importance %>% .[order(.$MeanDecreaseAccuracy, decreasing = T),]
+   }
    
-   return(fpnRates[3:6])
-   #return(fpnRates)
-})
+   ## Take top n
+   if(topn != F){
+      df_importance <- df_importance[1:topn,]
+   }
+   
+   ## Reverse MeanDecreaseAccuracy order again. ggplot2 coord_flip orders the MeanDecreaseAccuracy in the reverse order
+   df_importance <- df_importance %>% .[order(.$MeanDecreaseAccuracy, decreasing = F),]
+   
+   ## Plot id as x to ensure proper sorting order 
+   df_importance$id <- 1:nrow(df_importance)
+   
+   MeanDecAccPlot <- ggplot(df_importance,aes(id,MeanDecreaseAccuracy)) + 
+      geom_point(shape=1,size=2) + 
+      coord_flip() +
+      scale_x_discrete(labels=df_importance$feature,limits=1:length(df_importance$feature)) +
+      
+      theme(axis.title.y = element_blank(),
+            axis.text = element_text(size=10),
+            plot.title = element_text(hjust=0.5))
+   
+   if(title == 'Feature importance'){
+      MeanDecAccPlot <- MeanDecAccPlot + ggtitle('Feature importance')
+   } else {
+      MeanDecAccPlot <- MeanDecAccPlot + ggtitle(title)
+   }
+}
 
-abs(l_fpnRates[[1]][,1]-l_fpnRates[[1]][,2]) %>% min(.)
+#========= Stats functions =========#
+#--------- Get true/false positive/negative rates ---------#
+perfAsDf <- function(v_prob_predicted, v_logical_expected, metrics=c('tpr','tnr','fpr','fnr'))
+{
+   
+   # v_prob_predicted <- aggPred[,'BRCA']
+   # v_logical_expected <- df$response == 'BRCA'
+   
+   ROCRPred <- ROCR::prediction(v_prob_predicted, v_logical_expected)
+   
+   df_tfpnr <- lapply(metrics,function(i){
+      df_metric <- cbind(
+         performance(ROCRPred, measure = i)@x.values %>% unlist(),
+         performance(ROCRPred, measure = i)@y.values %>% unlist()
+      ) %>% as.data.frame()
+      colnames(df_metric) <- c('x','y')
+      
+      df_metric$metric <- i
+      
+      return(df_metric)
+   }) %>% do.call(rbind,.)
+   
+   return(df_tfpnr)
+}
 
-fpnRates_melt <- do.call(rbind,l_fpnRates)
+#--------- Plot true positive/negative rate ---------#
+## Depends on: perfAsDf()
+plot_tfpnRates <- function(v_prob_predicted=NULL, v_logical_expected=NULL, df_melt=NULL,
+                           metrics=c('tpr','tnr'), title='True positive vs. true negative rate', showIntersection=T)
+{
+   ## metrics check
+   if(!all(metrics %in% c('tpr','tnr','fpr','fnr'))){
+      stop('Metrics must be: tpr, tnr, fpr, fnr')
+   }
+   
+   ## By default, expect v_logical_expected and v_prob_predicted
+   ## Also accepts df output from get_tfpnRates
+   if( !(is.null(v_prob_predicted)) & !(is.null(v_logical_expected)) == T ){
+      df_melt <- perfAsDf(v_prob_predicted, v_logical_expected)
+   }
+   
+   df_melt <- df_melt[df_melt$metric %in% metrics,]
+   
+   tfpnRatesPlot <- ggplot(data=df_melt, aes(x=x, y=y, colour=metric)) +
+      geom_line() +
+      
+      ggtitle(title) +
+      xlab('Probability cutoff') +
+      ylab('Fractional value') +
+      scale_color_discrete(name='',labels = metrics) +
+      
+      theme(plot.title = element_text(hjust = 0.5))
+   
+   if(title == 'True positive vs. true negative rate'){
+      tfpnRatesPlot <- tfpnRatesPlot + ggtitle('True positive vs. true negative rate')
+   } else {
+      tfpnRatesPlot <- tfpnRatesPlot + ggtitle(title)
+   }
+   
+   if(showIntersection == T){
+      
+      diff_tpnRate <- abs( df_melt[df_melt$metric == 'tpr','y'] - df_melt[df_melt$metric == 'tnr','y'] )
+      intersection <- which(diff_tpnRate == min(diff_tpnRate)) %>% df_melt[.,'x']
+      
+      tfpnRatesPlot <- tfpnRatesPlot +
+         geom_vline(xintercept = intersection,linetype = 3,colour = 'black') +
+         annotate('text', x=intersection*0.95, y=0.07, hjust = 1, vjust = 0.5, label=paste0('P = ',intersection))
+   }
+   
+   return(tfpnRatesPlot)
+}
 
-## for HRDetect logistic regression
-brca_annotation_vs_pbrca_ss <- read.table('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/plots_compare_hrdetect_pipelines/brca_annotation_vs_pbrca_ss_multi_datasets.tsv',
-           sep = '\t',header=T)[1:5]
+#--------- Plot ROC curve ---------#
+## Depends on: perfAsDf()
+plot_ROC <- function(v_prob_predicted=NULL, v_logical_expected=NULL, title='ROC', showAUC=T)
+{
+   df_melt <- perfAsDf(v_prob_predicted, v_logical_expected, metrics=c('tpr','fpr'))
+   
+   df_tpr_fpr <- cbind(
+      df_melt[df_melt$metric == 'fpr','y'],
+      df_melt[df_melt$metric == 'tpr','y']
+   ) %>% as.data.frame()
+   colnames(df_tpr_fpr) <- c('x','y')
+   
+   ROCPlot <- ggplot(data=df_tpr_fpr, aes(x=x, y=y)) +
+      geom_line() +
+      geom_abline(intercept = 0, slope = 1, linetype=3) + 
+      
+      xlab('False positive rate') +
+      ylab('True positive rate') +
+      theme(plot.title = element_text(hjust = 0.5))
+   
+   if(title == 'ROC'){
+      ROCPlot <- ROCPlot + ggtitle('ROC')
+   } else {
+      ROCPlot <- ROCPlot + ggtitle(title)
+   }
+   
+   if(showAUC == T){
+      auc <- prediction(v_prob_predicted, v_logical_expected) %>% performance(.,'auc') %>% .@y.values %>% unlist()
+      ROCPlot <- ROCPlot + annotate('text', x=0.5, y=min(df_tpr_fpr$y), hjust = 0.5, vjust = 0.5, label=paste0('AUROC = ', auc %>% round(.,4)))
+   }
+   
+   return(ROCPlot)
+}
 
-fpnRate_predictorProb <- lapply(p_range, function(j){
-   get_fPosNegRate(brca_annotation_vs_pbrca_ss$brca_annotation,brca_annotation_vs_pbrca_ss[,'predictorProb'] > j)
-}) %>% do.call(rbind,.) %>% as.data.frame() %>% .[,3:4]
-fpnRate_predictorProb$p <- p_range
-fpnRate_predictorProb$analysis <- 'LRpBRCA_HRDetect'
+#--------- Plot precision recall ---------#
+## Precision/Positive predictive value: probability that subjects with a positive screening test truly have the disease
+## Recall/True positive rate
+calc_AUPRC <- function(v_prob_predicted, v_logical_expected){
+   df_melt <- perfAsDf(v_prob_predicted, v_logical_expected, metrics=c('ppv','tpr'))
+   
+   ## Prepare dataframe
+   df_ppv_tpr <- cbind(
+      df_melt[df_melt$metric == 'tpr','y'],
+      df_melt[df_melt$metric == 'ppv','y']
+   ) %>% .[,] %>% as.data.frame()
+   colnames(df_ppv_tpr) <- c('x','y')
+   
+   ## Assign point (0,1) as first point
+   df_ppv_tpr[df_ppv_tpr$x==0,]$y <- 1
+   
+   ## AUC calculation
+   df_ppv_tpr_aucCalc <- df_ppv_tpr[df_ppv_tpr$x != 1,] %>% rbind(.,c(1,0)) ## Set (1,0) as last coordinate (set last y value to 0)
+   auc <- integrateDiscrete(df_ppv_tpr_aucCalc) ## No need to divide by max(x)*max(y); lims are already (1,1)
+   return(auc)
+}
 
-## plot true positive and true negative rates
-# fpnRates_melt <- melt(fpnRates[,c('p','tpos_rate')], id.vars = 'p')
-fpnRates_melt <- rbind(fpnRates_melt,fpnRate_predictorProb)
+plot_PRC <- function(v_prob_predicted=NULL, v_logical_expected=NULL, title='PRC', showAUC=T)
+{
+   #df_melt <- perfAsDf(agg_pred$BRCA,agg_pred$response, metrics=c('ppv','tpr'))
+   #title='test'
+   
+   df_melt <- perfAsDf(v_prob_predicted, v_logical_expected, metrics=c('ppv','tpr'))
+   
+   ## Prepare dataframe
+   df_ppv_tpr <- cbind(
+      df_melt[df_melt$metric == 'tpr','y'],
+      df_melt[df_melt$metric == 'ppv','y']
+   ) %>% .[,] %>% as.data.frame()
+   colnames(df_ppv_tpr) <- c('x','y')
+   
+   ## Assign point (0,1) as first point
+   df_ppv_tpr[df_ppv_tpr$x==0,]$y <- 1
+   
+   PRCPlot <- ggplot(data=df_ppv_tpr, aes(x=x, y=y)) +
+      geom_line() +
+      geom_hline(yintercept = 0.5, linetype=3) +
+      
+      ggtitle(title) +
+      ylab('Positive predictive value') +
+      xlab('True positive rate') +
+      
+      theme(plot.title = element_text(hjust = 0.5))
+   
+   if(title == 'PRC'){
+      PRCPlot <- PRCPlot + ggtitle('PRC')
+   } else {
+      PRCPlot <- PRCPlot + ggtitle(title)
+   }
+   
+   ## Calculate AUC
+   if(showAUC == T){
+      df_ppv_tpr_aucCalc <- df_ppv_tpr[df_ppv_tpr$x != 1,] %>% rbind(.,c(1,0)) ## Set (1,0) as last coordinate (set last y value to 0)
+      
+      auc <- integrateDiscrete(df_ppv_tpr_aucCalc) ## No need to divide by max(x)*max(y); lims are already (1,1)
+      PRCPlot <- PRCPlot + annotate('text', x=0.5, y=min(df_ppv_tpr$y), hjust = 0.5, vjust = 0.5, label=paste0('AUPRC = ', auc %>% round(.,4)))
+   }
+   
+   return(PRCPlot)
+}
 
-## separate tpos and tneg rate plots
-# tposRates_plot <- ggplot(data=fpnRates_melt,aes(x=p, y=tpos_rate, colour=analysis)) +
-#    geom_line() +
-#    ggtitle('True positive rates at varying probability cutoffs') +
-#    xlab('Probability') +
-#    ylab('True positive rate')
-# 
-# tnegRates_plot <- ggplot(data=fpnRates_melt,aes(x=p, y=tneg_rate, colour=analysis)) +
-#    geom_line(linetype = 2) +
-#    ggtitle('True negative rates at varying probability cutoffs') +
-#    xlab('Probability') +
-#    ylab('True negative rate')
-# 
-# pdf('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/truePosNegRates_bagged.pdf', 8, 4)
-# plot(tposRates_plot)
-# plot(tnegRates_plot)
-# dev.off()
+#--------- Plot feature AUPRC or AUROC ---------#
+plot_AUCFeatSel <- function(df_summaryFeatSel, metric='auprc')
+{
+   if(!(metric %in% c('auprc','auroc'))){
+      stop('Metric must be: auprc, auroc')
+   }
+   
+   AUCFeatSelPlot <- ggplot(df_summaryFeatSel, aes_string(x='iter', y=metric, label='feature')) +
+      geom_point(shape=1) +
+      stat_smooth(method = 'loess', span = 1, fill = NA, size = 0.5, colour = 'red') +
+      
+      xlab('Minimum meanDecreaseAccuracy feature |  Iteration') +
+      ylab(toupper(metric)) +
+      
+      ggtitle('Iterative feature selection by MeanDecreaseAccuracy') +
+      
+      theme(plot.title = element_text(size = 12, hjust = 0.5),
+            axis.text.x = element_text(angle = 90, hjust = 1),
+            panel.grid.major.y = element_blank(),
+            panel.grid.minor.y = element_blank(),
+            panel.grid.minor.x = element_blank(),
+            axis.text=element_text(size=11),
+            axis.title=element_text(size=12)) +
+      
+      scale_x_continuous(breaks = df_summaryFeatSel$iter,
+                         labels = paste0(df_summaryFeatSel$feature, ' | ',
+                                         str_pad(df_summaryFeatSel$iter,2,pad='0') ) )
+   
+   return(AUCFeatSelPlot)
+}
 
-## combine tpos and tneg plots
-tPosPegRates_include <- fpnRates_melt$analysis %>% factor %>% levels %>% .[c(3,4,5,6,7)]
-tPosPegRates_plot <- ggplot(data=fpnRates_melt[fpnRates_melt$analysis %in% tPosPegRates_include,]) +
-   geom_line(aes(x=p, y=tpos_rate, colour=analysis)) +
-   geom_line(aes(x=p, y=tneg_rate, colour=analysis),linetype = 2) +
-   ggtitle('Solid: true positive rate; Dashed: true negative rate') +
-   xlab('Probability') +
-   ylab('True positive/negative rate')
+####################################
+#          Functions: End          #
+####################################
 
-pdf('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/truePosNegRates_mixData.pdf', 10, 4)
-plot(tPosPegRates_plot)
+#========= Paths =========#
+localPathPrefix <- '/Users/lnguyen/'
+hpcPath <- '/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/trainingMain_umcuData_whitelist/'
+if( dir.exists(localPathPrefix) ){
+   base_dir <- paste0(localPathPrefix, hpcPath)
+} else {
+   base_dir <- hpcPath
+}
+
+#========= Donor white list =========#
+## donors that are CERTAIN to be BRCA proficient or deficient
+donorWhitelist <- read.table( '/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/ML_data/donorWhitelist.tsv', sep='\t',header=T)
+donorWhitelistNames <- rownames(donorWhitelist)
+
+#========= UMCU data =========#
+df_umcuNormData <- read.table( paste0(base_dir,'df_umcuNormData_BRCAsimple.tsv'),sep='\t',header=T)
+df_umcuNormData$response <- as.factor(df_umcuNormData$response)
+
+df_umcuNormData_whitelist <- df_umcuNormData %>% .[rownames(.) %in% donorWhitelistNames,]
+
+#========= CV and plots =========#
+rfCV <- randomForest_CV(df_umcuNormData_whitelist, colname_response = 'response',inclExpectedResponse = T)
+
+## Aggregate information
+agg_pred <- aggregate_rfCV(rfCV, 'prediction')
+agg_pred$response <- get_simpleResponse(agg_pred$response,'BRCA',1,'none',0)
+
+agg_imp <- aggregate_rfCV(rfCV, 'importance')
+
+## Plotting
+rfCV_summaryPlots <- list(
+   plot_MeanDecreaseAccuracy(agg_imp,topn = F),
+   plot_tfpnRates(agg_pred$BRCA,agg_pred$response),
+   plot_ROC(agg_pred$BRCA,agg_pred$response),
+   plot_PRC(agg_pred$BRCA,agg_pred$response)
+)
+
+## Export
+pdf(paste0(base_dir,'rfCV_summaryPlots.pdf'),10,10)
+grid.arrange(grobs = rfCV_summaryPlots, nrow = 2, ncol = 2)
 dev.off()
 
+#========= Feature selection =========#
+df <- df_umcuNormData_whitelist
 
-#::::::::: Distinguishing BRCA1 and BRCA1 deficiency :::::::::#
-#========= Train with umcu data =========#
-#--------- Data prep ---------#
-v_brca1_deficiency <- as.integer(as.vector(rawdata$Gene) == 'BRCA1') %>% as.factor()
-v_brca2_deficiency <- as.integer(as.vector(rawdata$Gene) == 'BRCA2') %>% as.factor()
-# 
-# names(v_brca1_deficiency) <- rawdata$Sample
-# names(v_brca2_deficiency) <- rawdata$Sample
-# 
-# umcu_normdata_brca1.2 <- umcu_normdata
-# 
-# umcu_normdata_brca1.2$brca_deficiency <- NULL
-# umcu_normdata_brca1.2$brca1_deficiency <- v_brca1_deficiency[names(v_brca1_deficiency) %in% common_donors]
-# umcu_normdata_brca1.2$brca2_deficiency <- v_brca2_deficiency[names(v_brca2_deficiency) %in% common_donors]
+nFeatures <- ncol(df_umcuNormData_whitelist)-1
+featSelIters <- 1:(nFeatures-1) ## End when only 1 feature(s) are left
 
-v_brca1.2_deficiency <- rawdata[,c('Sample','Gene')]
-v_brca1.2_deficiency[nchar(v_brca1.2_deficiency$Gene) == 0,'Gene'] <- 0
+f_report <- paste0(base_dir,'summaryFeatureSelection.tsv')
+write.table(paste('iter','minImpVar','feature','auroc','auprc','optimalCutOff',sep = '\t'), f_report, col.names = F, row.names = F, quote = F)
 
-v_brca1.2_deficiency$Gene <- v_brca1.2_deficiency$Gene %>% gsub('BRCA','',.)
-rownames(v_brca1.2_deficiency) <- v_brca1.2_deficiency$Sample
-v_brca1.2_deficiency$Sample <- NULL
+v_minImpVar <- c()
+for(iter in featSelIters){
+   message(paste0('<< Feature selection: round ', iter,' >>'))
+   iterName <- str_pad(iter, 2, pad = "0")
+   
+   df_ss <- df[,!(colnames(df) %in% names(v_minImpVar))]
+   rfCV <- randomForest_CV(df_ss, 
+                           colname_response = 'response',inclExpectedResponse = T)
+   
+   ## Aggregate information
+   message('Aggregating CV information...')
+   agg_pred <- aggregate_rfCV(rfCV, 'prediction')
+   agg_pred$response <- get_simpleResponse(agg_pred$response,'BRCA',1,'none',0)
+   
+   agg_imp <- aggregate_rfCV(rfCV, 'importance')
+   
+   ## Plotting
+   message('Making summary plots...')
+   rfCV_summaryPlots <- list(
+      plot_MeanDecreaseAccuracy(agg_imp, topn = F),
+      plot_tfpnRates(agg_pred$BRCA, agg_pred$response),
+      plot_ROC(agg_pred$BRCA, agg_pred$response),
+      plot_PRC(agg_pred$BRCA, agg_pred$response)
+   )
+   
+   pdf(paste0(base_dir,'summaryPlotsFeatSel_iter',iterName,'.pdf'),10,10)
+   grid.arrange(grobs = rfCV_summaryPlots, nrow = 2, ncol = 2)
+   dev.off()
+   
+   ## Append to summary table
+   message('Writing to summary table...')
+   
+   df_minImpVar <- agg_imp %>% .[.$MeanDecreaseAccuracy == min(.$MeanDecreaseAccuracy),]
+   minImpVar <- df_minImpVar$MeanDecreaseAccuracy
+   minImpVarFeature <- df_minImpVar$feature
+   
+   auroc <- prediction(agg_pred$BRCA, agg_pred$response) %>% performance(.,'auc') %>% .@y.values %>% unlist()
+   auprc <- calc_AUPRC(agg_pred$BRCA, agg_pred$response)
+   
+   df_tfpnRates <- perfAsDf(agg_pred$BRCA, agg_pred$response)
+   diff_tpnRate <- abs( df_tfpnRates[df_tfpnRates$metric == 'tpr','y'] - df_tfpnRates[df_tfpnRates$metric == 'tnr','y'] )
+   intersection <- which(diff_tpnRate == min(diff_tpnRate)) %>% df_tfpnRates[.,'x']
+   
+   write(paste(iter,minImpVar,minImpVarFeature,auroc,auprc,intersection,sep='\t'), f_report, append = T)
+   
+   ## Append to feature exclusion vector
+   names(minImpVar) <- minImpVarFeature
+   v_minImpVar <- c(v_minImpVar,minImpVar)
+}
 
-umcu_normdata_brca1.2 <- umcu_normdata
-umcu_normdata_brca1.2$brca_deficiency <- v_brca1.2_deficiency[rownames(v_brca1.2_deficiency) %in% common_donors,] %>% as.factor
+#========= Plot feature selection summary =========#
+df_summaryFeatSel <- read.table(paste0(base_dir,'summaryFeatureSelection.tsv'), header = T, sep = '\t')
 
-#--------- Test run random forest ---------#
-# ## Determine in-bag samples and run random forest
-# rf_train <- sample(1:nrow(umcu_normdata_brca1.2), (nrow(umcu_normdata_brca1.2) * 0.63212056) %>% round(0) ) ## 0.632 rule; choose ~2/3 of data set for training
-# rf_umcu_normdata_brca1.2 <- randomForest(formula = brca_deficiency ~ ., data = umcu_normdata_brca1.2, subset = rf_train, ntree = 500,importance =T)
-# predict(object = rf_umcu_normdata_brca1.2,newdata = umcu_normdata_brca1.2,type = "prob") %>%
-#    cbind(., umcu_normdata_brca1.2$brca_deficiency %>% as.integer() - 1)
-
-
-
-#--------- Get best mtry's ---------#
-mtry_best_umcu_brca1.2 <- tuneRF_iterate(umcu_normdata_brca1.2, 'brca_deficiency')
-
-#--------- Train RF ---------#
-rf_umcu_normdata_brca1.2 <- randomForest_iterate(umcu_normdata_brca1.2,'brca_deficiency',mtry_best_umcu_brca1.2,randomForest_iterations=100)
-
-RFpBRCA_umcuDataB1B2_umcuDataB1B2Trained <- predict(object = rf_umcu_normdata_brca1.2,newdata = umcu_normdata_brca1.2,type = "prob")
-
-pdf('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/MeanDecreaseAcc_rfTraining_BRCA1and2.pdf', 10, 6)
-varImpPlot(rf_umcu_normdata_brca1.2,type=1,class = 1,main = 'BRCA1 deficiency')
-varImpPlot(rf_umcu_normdata_brca1.2,type=1,class = 2,main = 'BRCA2 deficiency')
-dev.off()
-
-# importance(rf_umcu_normdata_brca1.2)
-# varImpPlot(rf_umcu_normdata_brca1.2,type=1,class = 1)
-# varImpPlot(rf_umcu_normdata_brca1.2,type=1,class = 2)
-
-#--------- RF vs annotation ---------#
-rf_vs_annotation2 <- rawdata[rawdata$Sample %in% common_donors,c("Sample","Gene")]
-rf_vs_annotation2$B1_exp <- as.integer(rf_vs_annotation2$Gene == 'BRCA1')
-rf_vs_annotation2$B2_exp <- as.integer(rf_vs_annotation2$Gene == 'BRCA2')
-
-rf_vs_annotation2 <- cbind(rf_vs_annotation2,RFpBRCA_umcuDataB1B2_umcuDataB1B2Trained[,2:3])
-colnames(rf_vs_annotation2)[5:6] <- c('B1_pred', 'B2_pred')
-
-# ## check if there are any predictions of both brca1/2
-# rf_vs_annotation2_ss <- rf_vs_annotation2[nchar(rf_vs_annotation2$Gene) > 0,]
-# 
-# apply(rf_vs_annotation2_ss[3:6],1,function(i){
-#    if(i[1] == 1 & i[3] > i[4]){
-#       return(1)
-#    } else if(i[2] == 1 & i[4] > i[3]){
-#       return(1)
-#    } else {
-#       return(0)
-#    }
-#    #return(i)
-# })
-
-if(rf_vs_annotation2_ss$B1_exp == 1 & rf_vs_annotation2_ss$B1_pred > rf_vs_annotation2_ss$B2_pred){1} else {0}
-
-#--------- True pos/neg rates
-p_range <- seq(from=0, to=1.0, by=0.01)
-
-B1_tPosNegRates <- lapply(p_range,function(j){
-   get_fPosNegRate(rf_vs_annotation2$B1_exp,rf_vs_annotation2$B1_pred > j)
-}) %>% do.call(rbind,.) %>% as.data.frame() %>% .[,c(3,4)]
-B1_tPosNegRates$Gene <- 'BRCA1'
-B1_tPosNegRates$p <- p_range
-
-B2_tPosNegRates <- lapply(p_range,function(j){
-   get_fPosNegRate(rf_vs_annotation2$B2_exp,rf_vs_annotation2$B2_pred > j)
-}) %>% do.call(rbind,.) %>% as.data.frame() %>% .[,c(3,4)]
-B2_tPosNegRates$Gene <- 'BRCA2'
-B2_tPosNegRates$p <- p_range
-
-B1_B2_tPosNegRates <- rbind(B1_tPosNegRates,B2_tPosNegRates)
-
-B1_B2_tPosNegRates_plot <- ggplot(data=B1_B2_tPosNegRates) +
-   geom_line(aes(x=p, y=tpos_rate, colour=Gene)) +
-   geom_line(aes(x=p, y=tneg_rate, colour=Gene),linetype = 2) +
-   ggtitle('Solid: true positive rate; Dashed: true negative rate') +
-   xlab('Probability') +
-   ylab('True positive/negative rate')
-
-pdf('/Users/lnguyen/hpc/cog_bioinf/cuppen/project_data/Luan_PCAGW/results/hr_detect/random_forest_training/truePosNegRates_BRCA1and2.pdf', 8, 4)
-plot(B1_B2_tPosNegRates_plot)
+pdf(paste0(base_dir,'AUCvsFeatSel.pdf'),9,4)
+plot_AUCFeatSel(df_summaryFeatSel, metric = 'auroc')
+plot_AUCFeatSel(df_summaryFeatSel, metric = 'auprc')
 dev.off()
